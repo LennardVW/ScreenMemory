@@ -1,10 +1,9 @@
 import Foundation
-import Vision
 import AppKit
+import Vision
 
 // MARK: - ScreenMemory
-/// Searchable screenshot history with OCR
-/// Captures, indexes, and searches through all screenshots
+/// REAL searchable screenshot history with OCR
 
 @main
 struct ScreenMemory {
@@ -16,36 +15,48 @@ struct ScreenMemory {
 
 @MainActor
 final class ScreenMemoryCore {
-    private var screenshots: [Screenshot] = []
-    private let screenshotsDir = FileManager.default.homeDirectoryForCurrentUser
-        .appendingPathComponent("Screenshots")
+    private var screenshotsDir: URL {
+        FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent("Screenshots")
+    }
+    private var indexPath: URL {
+        FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent(".screenmemory/index.json")
+    }
+    private var screenshots: [ScreenshotRecord] = []
+    private var isWatching = false
     
-    struct Screenshot: Identifiable {
-        let id = UUID()
-        let path: String
+    struct ScreenshotRecord: Codable, Identifiable {
+        let id: UUID
+        let filename: String
         let timestamp: Date
         let ocrText: String
-        let appContext: String
+        let appName: String
+        let windowTitle: String
+        let url: String?
     }
     
     func run() async {
+        createDirectories()
+        loadIndex()
+        
         print("""
         📸 ScreenMemory - Searchable Screenshot History
         
         Commands:
-          capture              Take screenshot and index it
-          search <query>       Search through all screenshots
-          list [n]             List recent screenshots
-          watch                Auto-capture every 30 seconds
-          export <id>          Export screenshot to desktop
-          delete <id>          Delete screenshot
-          stats                Show collection statistics
-          help                 Show this help
-          quit                 Exit
-        """)
+          capture           Take screenshot now
+          watch             Auto-capture every 30 seconds
+          search <query>    Search through screenshots
+          list [n]          List recent (default: 10)
+          open <id>         Open screenshot
+          text <id>         Show extracted text
+          stop              Stop watching
+          stats             Show statistics
+          help              Show help
+          quit              Exit
         
-        createScreenshotsDirectory()
-        loadExistingScreenshots()
+        Screenshots saved to: ~/Screenshots/
+        """)
         
         while true {
             print("> ", terminator: "")
@@ -56,23 +67,26 @@ final class ScreenMemoryCore {
             let arg = parts.count > 1 ? String(parts[1]) : ""
             
             switch command {
-            case "capture", "c":
+            case "capture", "c", "snap":
                 await captureScreenshot()
-            case "search", "s", "find":
-                await searchScreenshots(query: arg)
-            case "list", "ls":
-                listScreenshots(count: Int(arg) ?? 10)
             case "watch", "w":
-                await watchMode()
-            case "export", "e":
-                exportScreenshot(id: arg)
-            case "delete", "rm":
-                deleteScreenshot(id: arg)
-            case "stats":
+                await startWatching()
+            case "stop", "s":
+                stopWatching()
+            case "search", "find", "f":
+                await searchScreenshots(query: arg)
+            case "list", "ls", "l":
+                listScreenshots(count: Int(arg) ?? 10)
+            case "open", "o":
+                openScreenshot(id: arg)
+            case "text", "t":
+                showText(id: arg)
+            case "stats", "stat":
                 showStats()
             case "help", "h":
                 showHelp()
             case "quit", "q", "exit":
+                stopWatching()
                 print("👋 Goodbye!")
                 return
             default:
@@ -82,80 +96,64 @@ final class ScreenMemoryCore {
     }
     
     func captureScreenshot() async {
-        print("📸 Capturing screenshot...")
-        
         let timestamp = Date()
-        let filename = "screenshot_\(formatTimestamp(timestamp)).png"
+        let filename = "screen_\(formatTimestamp(timestamp)).png"
         let filepath = screenshotsDir.appendingPathComponent(filename).path
+        
+        print("📸 Capturing screenshot...")
         
         // Use screencapture command
         let task = Process()
         task.launchPath = "/usr/sbin/screencapture"
-        task.arguments = ["-x", filepath] // -x = no sound
+        task.arguments = ["-x", filepath]
         
         try? task.run()
         task.waitUntilExit()
         
-        // Perform OCR
-        print("🔍 Running OCR...")
-        let ocrText = await performOCR(on: filepath)
-        
-        // Get active app
-        let app = getActiveApp()
-        
-        let screenshot = Screenshot(
-            path: filepath,
-            timestamp: timestamp,
-            ocrText: ocrText,
-            appContext: app
-        )
-        
-        screenshots.insert(screenshot, at: 0)
-        
-        print("✅ Captured and indexed")
-        print("   Time: \(formatTime(timestamp))")
-        print("   App: \(app)")
-        print("   Text found: \(ocrText.prefix(100))\(ocrText.count > 100 ? "..." : "")")
-    }
-    
-    func searchScreenshots(query: String) async {
-        guard !query.isEmpty else {
-            print("❌ Please enter a search query")
+        guard FileManager.default.fileExists(atPath: filepath) else {
+            print("❌ Failed to capture screenshot")
+            print("   Make sure Screen Recording permission is granted")
             return
         }
         
-        print("🔍 Searching for '\(query)'...")
+        // Get context
+        let appName = getActiveApp()
+        let windowTitle = getWindowTitle()
+        let url = getCurrentURL()
         
-        let results = screenshots.filter { screenshot in
-            screenshot.ocrText.lowercased().contains(query.lowercased()) ||
-            screenshot.appContext.lowercased().contains(query.lowercased())
-        }
+        // Perform OCR
+        print("🔍 Running OCR...")
+        let ocrText = await performOCR(imagePath: filepath)
         
-        if results.isEmpty {
-            print("No screenshots found matching '\(query)'")
-        } else {
-            print("Found \(results.count) screenshot(s):\n")
-            for screenshot in results {
-                displayScreenshotInfo(screenshot)
-            }
-        }
+        let record = ScreenshotRecord(
+            id: UUID(),
+            filename: filename,
+            timestamp: timestamp,
+            ocrText: ocrText,
+            appName: appName,
+            windowTitle: windowTitle,
+            url: url
+        )
+        
+        screenshots.insert(record, at: 0)
+        saveIndex()
+        
+        print("✅ Captured: \(filename)")
+        print("   App: \(appName)")
+        if !windowTitle.isEmpty { print("   Window: \(windowTitle)") }
+        if let url = url { print("   URL: \(url)") }
+        print("   Text: \(ocrText.prefix(80))\(ocrText.count > 80 ? "..." : "")")
     }
     
-    func listScreenshots(count: Int) {
-        let toShow = min(count, screenshots.count)
-        
-        print("📸 Recent \(toShow) screenshot(s):\n")
-        
-        for screenshot in screenshots.prefix(toShow) {
-            displayScreenshotInfo(screenshot, compact: true)
+    func startWatching() async {
+        guard !isWatching else {
+            print("⚠️  Already watching")
+            return
         }
-    }
-    
-    func watchMode() async {
-        print("👁️  Watch mode started (capture every 30s)")
-        print("   Press Enter to stop...")
         
-        var isWatching = true
+        isWatching = true
+        print("👁️  Watching... Capturing every 30 seconds")
+        print("   Press Enter to stop")
         
         Task {
             while isWatching {
@@ -165,88 +163,224 @@ final class ScreenMemoryCore {
         }
         
         _ = readLine()
+        stopWatching()
+    }
+    
+    func stopWatching() {
         isWatching = false
-        print("👁️  Watch mode stopped")
+        print("🛑 Stopped watching")
     }
     
-    private func displayScreenshotInfo(_ screenshot: Screenshot, compact: Bool = false) {
-        let id = screenshot.id.uuidString.prefix(8)
-        let time = formatTime(screenshot.timestamp)
+    func searchScreenshots(query: String) async {
+        guard !query.isEmpty else {
+            print("❌ Enter a search query")
+            return
+        }
         
-        if compact {
-            print("[\(id)] \(time) - \(screenshot.appContext)")
-        } else {
-            print("━".repeating(50))
-            print("ID: \(id)")
-            print("Time: \(time)")
-            print("App: \(screenshot.appContext)")
-            print("Text: \(screenshot.ocrText.prefix(150))\(screenshot.ocrText.count > 150 ? "..." : "")")
-            print()
+        guard !screenshots.isEmpty else {
+            print("⚠️  No screenshots captured yet")
+            return
+        }
+        
+        let lowerQuery = query.lowercased()
+        
+        // Parse special queries
+        var appFilter: String?
+        var timeFilter: TimeInterval?
+        
+        if lowerQuery.contains("from:") {
+            let parts = lowerQuery.components(separatedBy: "from:")
+            if parts.count > 1 {
+                appFilter = parts[1].trimmingCharacters(in: .whitespaces)
+            }
+        }
+        
+        if lowerQuery.contains("ago") {
+            timeFilter = parseTimeQuery(lowerQuery)
+        }
+        
+        let results = screenshots.filter { record in
+            var matches = true
+            
+            if let appFilter = appFilter {
+                matches = matches && record.appName.lowercased().contains(appFilter)
+            }
+            
+            if let timeFilter = timeFilter {
+                matches = matches && Date().timeIntervalSince(record.timestamp) <= timeFilter
+            }
+            
+            if appFilter == nil && timeFilter == nil {
+                matches = record.ocrText.lowercased().contains(lowerQuery) ||
+                         record.appName.lowercased().contains(lowerQuery) ||
+                         record.filename.lowercased().contains(lowerQuery)
+            }
+            
+            return matches
+        }
+        
+        print("🔍 Found \(results.count) screenshot(s):\n")
+        for record in results {
+            displayRecord(record, compact: true)
         }
     }
     
-    private func performOCR(on imagePath: String) async -> String {
-        // In production: Use Vision framework
-        // For now, return placeholder
-        return "OCR not implemented in demo. Would extract all visible text."
+    func listScreenshots(count: Int) {
+        let toShow = min(count, screenshots.count)
+        
+        guard toShow > 0 else {
+            print("📭 No screenshots yet")
+            return
+        }
+        
+        print("📸 Last \(toShow) screenshot(s):\n")
+        for record in screenshots.prefix(toShow) {
+            displayRecord(record, compact: true)
+        }
     }
     
-    private func getActiveApp() -> String {
-        let workspace = NSWorkspace.shared
-        return workspace.frontmostApplication?.localizedName ?? "Unknown"
-    }
-    
-    private func exportScreenshot(id: String) {
-        guard let screenshot = screenshots.first(where: { $0.id.uuidString.hasPrefix(id) }) else {
+    func openScreenshot(id: String) {
+        guard let record = screenshots.first(where: { $0.id.uuidString.hasPrefix(id) }) else {
             print("❌ Screenshot not found")
             return
         }
         
-        let desktop = FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent("Desktop")
-        let dest = desktop.appendingPathComponent(URL(fileURLWithPath: screenshot.path).lastPathComponent)
+        let path = screenshotsDir.appendingPathComponent(record.filename).path
         
-        try? FileManager.default.copyItem(atPath: screenshot.path, toPath: dest.path)
-        print("✅ Exported to Desktop")
+        let task = Process()
+        task.launchPath = "/usr/bin/open"
+        task.arguments = [path]
+        try? task.run()
+        
+        print("📖 Opening \(record.filename)...")
     }
     
-    private func deleteScreenshot(id: String) {
-        guard let index = screenshots.firstIndex(where: { $0.id.uuidString.hasPrefix(id) }) else {
+    func showText(id: String) {
+        guard let record = screenshots.first(where: { $0.id.uuidString.hasPrefix(id) }) else {
             print("❌ Screenshot not found")
             return
         }
         
-        let screenshot = screenshots[index]
-        try? FileManager.default.removeItem(atPath: screenshot.path)
-        screenshots.remove(at: index)
-        
-        print("✅ Deleted screenshot")
+        print("━".repeating(50))
+        print("📝 Extracted text from \(record.filename):")
+        print()
+        print(record.ocrText)
+        print("━".repeating(50))
     }
     
-    private func showStats() {
+    func showStats() {
         print("📊 Statistics:")
         print("   Total screenshots: \(screenshots.count)")
-        print("   Oldest: \(screenshots.last.map { formatTime($0.timestamp) } ?? "N/A")")
-        print("   Newest: \(screenshots.first.map { formatTime($0.timestamp) } ?? "N/A")")
+        
+        let totalSize = screenshots.reduce(0) { total, record in
+            let path = screenshotsDir.appendingPathComponent(record.filename).path
+            let size = (try? FileManager.default.attributesOfItem(atPath: path)[.size] as? Int) ?? 0
+            return total + size
+        }
+        print("   Total size: \(formatBytes(totalSize))")
         
         // App breakdown
         var appCounts: [String: Int] = [:]
-        for screenshot in screenshots {
-            appCounts[screenshot.appContext, default: 0] += 1
+        for record in screenshots {
+            appCounts[record.appName, default: 0] += 1
         }
         
         print("\n   By app:")
-        for (app, count) in appCounts.sorted(by: { $0.value > $1.value }) {
+        for (app, count) in appCounts.sorted(by: { $0.value > $1.value }).prefix(5) {
             print("      \(app): \(count)")
         }
     }
     
-    private func createScreenshotsDirectory() {
-        try? FileManager.default.createDirectory(at: screenshotsDir, withIntermediateDirectories: true)
+    private func performOCR(imagePath: String) async -> String {
+        guard FileManager.default.fileExists(atPath: imagePath) else {
+            return ""
+        }
+        
+        let imageURL = URL(fileURLWithPath: imagePath)
+        
+        guard let image = NSImage(contentsOf: imageURL),
+              let cgImage = image.cgImage(forProposedRect: nil, context: nil, hints: nil) else {
+            return ""
+        }
+        
+        let request = VNRecognizeTextRequest()
+        request.recognitionLevel = .accurate
+        request.usesLanguageCorrection = true
+        
+        let handler = VNImageRequestHandler(cgImage: cgImage, options: [:])
+        
+        do {
+            try handler.perform([request])
+            
+            let observations = request.results ?? []
+            let recognizedStrings = observations.compactMap { observation in
+                observation.topCandidates(1).first?.string
+            }
+            
+            return recognizedStrings.joined(separator: "\n")
+        } catch {
+            return "OCR Error: \(error.localizedDescription)"
+        }
     }
     
-    private func loadExistingScreenshots() {
-        // In production: Load from CoreData or JSON index
+    private func getActiveApp() -> String {
+        return NSWorkspace.shared.frontmostApplication?.localizedName ?? "Unknown"
+    }
+    
+    private func getWindowTitle() -> String {
+        // Would require Accessibility permissions to get actual window title
+        return ""
+    }
+    
+    private func getCurrentURL() -> String? {
+        // Would use AppleScript to get URL from browsers
+        return nil
+    }
+    
+    private func parseTimeQuery(_ query: String) -> TimeInterval? {
+        if query.contains("hour") {
+            return 3600
+        } else if query.contains("day") {
+            return 86400
+        } else if query.contains("week") {
+            return 604800
+        }
+        return nil
+    }
+    
+    private func displayRecord(_ record: ScreenshotRecord, compact: Bool) {
+        let id = record.id.uuidString.prefix(8)
+        let time = formatTime(record.timestamp)
+        
+        if compact {
+            print("[\(id)] \(time) | \(record.appName) | \(record.ocrText.prefix(50))...")
+        } else {
+            print("━".repeating(50))
+            print("📄 \(record.filename)")
+            print("   ID: \(id)")
+            print("   Time: \(time)")
+            print("   App: \(record.appName)")
+            if let url = record.url { print("   URL: \(url)") }
+            print("   Text: \(record.ocrText.prefix(100))...")
+        }
+    }
+    
+    private func createDirectories() {
+        try? FileManager.default.createDirectory(at: screenshotsDir, withIntermediateDirectories: true)
+        try? FileManager.default.createDirectory(at: indexPath.deletingLastPathComponent(), withIntermediateDirectories: true)
+    }
+    
+    private func loadIndex() {
+        guard let data = try? Data(contentsOf: indexPath),
+              let records = try? JSONDecoder().decode([ScreenshotRecord].self, from: data) else {
+            return
+        }
+        screenshots = records
+    }
+    
+    private func saveIndex() {
+        guard let data = try? JSONEncoder().encode(screenshots) else { return }
+        try? data.write(to: indexPath)
     }
     
     private func formatTimestamp(_ date: Date) -> String {
@@ -262,24 +396,24 @@ final class ScreenMemoryCore {
         return formatter.string(from: date)
     }
     
+    private func formatBytes(_ bytes: Int) -> String {
+        let mb = Double(bytes) / 1_048_576
+        return String(format: "%.1f MB", mb)
+    }
+    
     private func showHelp() {
         print("""
         Commands:
-          capture     Take screenshot and index it
-          search      Search through screenshots
-          list        List recent screenshots
-          watch       Auto-capture every 30s
-          export      Export screenshot to desktop
-          delete      Delete screenshot
-          stats       Show statistics
-          help        Show this help
-          quit        Exit
+          capture    Take screenshot now
+          watch      Auto-capture every 30s
+          search     Search screenshots
+          list       List recent
+          open       Open screenshot
+          text       Show extracted text
+          stop       Stop watching
+          stats      Show statistics
+          help       Show help
+          quit       Exit
         """)
-    }
-}
-
-extension String {
-    func repeating(_ count: Int) -> String {
-        String(repeating: self, count: count)
     }
 }
