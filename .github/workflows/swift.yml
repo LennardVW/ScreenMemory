@@ -1,0 +1,34 @@
+name: Swift CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  build:
+    runs-on: macos-15
+    
+    steps:
+    - uses: actions/checkout@v3
+    
+    - name: Setup Swift
+      uses: swift-actions/setup-swift@v1
+      with:
+        swift-version: '6.0'
+    
+    - name: Build
+      run: swift build
+    
+    - name: Run tests
+      run: swift test
+    
+    - name: Build Release
+      run: swift build -c release
+    
+    - name: Upload artifact
+      uses: actions/upload-artifact@v3
+      with:
+        name: screenmemory
+        path: .build/release/screenmemory
